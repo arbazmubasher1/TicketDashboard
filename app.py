@@ -1,39 +1,60 @@
+# app.py
+# ─────────────────────────────────────────────────────────────
+#  Team Ticket Dashboard  –  multi-user edition
+# ─────────────────────────────────────────────────────────────
+
 import streamlit as st
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import altair as alt
-import json
-# ✅ This must be first
+
+# ──────────────────────────────────────
+# ⚙️  Page setup
 st.set_page_config(page_title="Ticket Dashboard", layout="wide")
 
 # ──────────────────────────────────────
-# 🔐 Login Setup
-def login():
+# 👤  Very simple in-memory user store
+USERS = {
+    # email / username : {password, role, domain}
+    "osaid.jahangir@johnnyandjugnu.com": {
+        "password": "admin123", "role": "admin", "domain": None},
+
+    "leasing":      {"password": "L123",  "role": "user", "domain": "Leasing"},
+    "design":       {"password": "D123",  "role": "user", "domain": "Design"},
+    "equipment":    {"password": "E123",  "role": "user", "domain": "Equipment"},
+    "construction": {"password": "C123",  "role": "user", "domain": "Construction"},
+    "pm":           {"password": "PM123", "role": "user", "domain": "Project Management"},
+}
+
+ALL_DOMAINS = ["Leasing", "Design", "Equipment",
+               "Construction", "Project Management"]
+ALL_STATUSES = ["Initiated", "Partial", "Stuck", "Completed"]
+
+# ──────────────────────────────────────
+# 🔐  Login helper
+def login() -> None:
     st.title("🔐 Login to Ticket Dashboard")
 
     with st.form("login_form"):
-        email = st.text_input("Email")
+        email = st.text_input("Email or Username").lower().strip()
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login")
 
         if submitted:
-            if email == "osaid.jahangir@johnnyandjugnu.com" and password == "admin123":
-                st.session_state["logged_in"] = True
-                st.session_state["role"] = "admin"
-                st.session_state["email"] = email
-                st.rerun()
-            elif password == "admin123":
-                st.session_state["logged_in"] = True
-                st.session_state["role"] = "user"
-                st.session_state["email"] = email
+            user = USERS.get(email)
+            if user and password == user["password"]:
+                st.session_state["logged_in"]   = True
+                st.session_state["role"]        = user["role"]       # admin/user
+                st.session_state["email"]       = email
+                st.session_state["user_domain"] = user["domain"]     # None for admin
                 st.rerun()
             else:
                 st.error("❌ Incorrect credentials")
 
 # ──────────────────────────────────────
-# 🔐 Session Init
+# 🔐  Session init
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
@@ -42,135 +63,182 @@ if not st.session_state["logged_in"]:
     st.stop()
 
 # ──────────────────────────────────────
-# 🚪 Logout Button
+# 🚪  Sidebar – logout
 with st.sidebar:
-    st.write(f"Logged in as: {st.session_state.get('email')}")
+    st.write(f"Logged in as: **{st.session_state['email']}**")
     if st.button("🚪 Logout"):
         st.session_state.clear()
         st.rerun()
 
 # ──────────────────────────────────────
-# ✅ Google Sheets Setup
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["google_service_account"]), scope)
+# ✅  Google Sheets connection
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open("TicketDashboard").sheet1
 
 # ──────────────────────────────────────
-def get_data():
+# 📦  Data helpers
+def get_data() -> pd.DataFrame:
+    """Read all rows, convert date columns, add actual sheet row numbers."""
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
     if not df.empty:
         df["Created At"] = pd.to_datetime(df["Created At"])
-        df["Deadline"] = pd.to_datetime(df["Deadline"])
-        # Don't use df.index because filtering will break it — use row number from enumerate
-        df["SheetRow"] = [i + 2 for i in range(len(df))]  # Offset +2 to skip header
+        df["Deadline"]   = pd.to_datetime(df["Deadline"])
+        df["SheetRow"]   = [i + 2 for i in range(len(df))]  # +2 skips header row
     return df
 
-def add_ticket(task, domain, deadline, status, comments):
+def add_ticket(task: str, domain: str, deadline, status: str, comments: str) -> None:
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [task, domain, created_at, deadline.strftime("%Y-%m-%d"), status, "", comments]
     sheet.append_row(row)
 
-def update_elapsed_in_sheet(df):
+def update_elapsed_in_sheet(df: pd.DataFrame) -> None:
     now = datetime.now()
     elapsed_days = (now - df['Created At']).dt.days
     for idx, days in enumerate(elapsed_days):
         sheet.update_cell(idx + 2, 6, f"{days}")
 
-def delete_ticket(sheet_row):
+def delete_ticket(sheet_row: int) -> None:
     sheet.delete_rows(sheet_row)
 
-def update_ticket(sheet_row, task, domain, deadline, status, comments):
-    created_at = sheet.cell(sheet_row, 3).value
+def update_ticket(sheet_row: int, task: str, domain: str,
+                  deadline, status: str, comments: str) -> None:
+    created_at   = sheet.cell(sheet_row, 3).value
     elapsed_days = sheet.cell(sheet_row, 6).value
     sheet.update(
         f"A{sheet_row}:G{sheet_row}",
-        [[task, domain, created_at, deadline.strftime("%Y-%m-%d"), status, elapsed_days, comments]]
+        [[task, domain, created_at, deadline.strftime("%Y-%m-%d"),
+          status, elapsed_days, comments]]
     )
 
 # ──────────────────────────────────────
+# ✅  Multiselect helper with “Select all” (no session-state mutation)
+def multiselect_with_select_all(label: str, options: list[str], key_prefix: str) -> list[str]:
+    select_all_key  = f"{key_prefix}_select_all"
+    multiselect_key = f"{key_prefix}_multiselect"
+
+    select_all = st.checkbox(f"Select all {label.lower()}", key=select_all_key)
+    if select_all:
+        # disabled multiselect acts as visual feedback
+        st.multiselect(label, options, default=options, key=multiselect_key, disabled=True)
+        return options
+    else:
+        return st.multiselect(label, options, key=multiselect_key)
+
+# ──────────────────────────────────────
+# 🌐  UI  – title & CSS
 st.title("🎟️ Team Ticket Dashboard")
 
-# CSS Styling
 st.markdown("""
-    <style>
-    .ticket-card {
-        background-color: #ffffff;
-        padding: 18px 22px;
-        border-radius: 12px;
-        margin-bottom: 15px;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.05);
-    }
-    .ticket-header {
-        font-weight: 600;
-        font-size: 1.2rem;
-        margin-bottom: 5px;
-    }
-    .pill {
-        font-size: 0.75rem;
-        background-color: #eee;
-        padding: 3px 8px;
-        border-radius: 20px;
-        margin-left: 10px;
-    }
-    </style>
+<style>
+.ticket-card {
+    background-color: #ffffff;
+    padding: 18px 22px;
+    border-radius: 12px;
+    margin-bottom: 15px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.ticket-header {
+    font-weight: 600;
+    font-size: 1.2rem;
+    margin-bottom: 5px;
+}
+.pill {
+    font-size: 0.75rem;
+    background-color: #eee;
+    padding: 3px 8px;
+    border-radius: 20px;
+    margin-left: 10px;
+}
+</style>
 """, unsafe_allow_html=True)
 
-# Add Ticket Form
+# ──────────────────────────────────────
+# ➕  Add-ticket form
 with st.expander("➕ Add New Ticket"):
     with st.form("new_ticket"):
         col1, col2 = st.columns(2)
         task = col1.text_input("Task")
-        domain = col2.selectbox("Domain", ["Leasing", "Design", "Equipment", "Project Management"])
+
+        if st.session_state["role"] == "admin":
+            domain = col2.selectbox("Domain", ALL_DOMAINS)
+        else:
+            domain = st.session_state["user_domain"]
+            col2.text_input("Domain", value=domain, disabled=True)
+
         deadline = col1.date_input("Deadline")
-        status = col2.selectbox("Status", ["Initiated", "Partial", "Stuck", "Completed"])
+        status   = col2.selectbox("Status", ALL_STATUSES)
         comments = st.text_area("Comments")
+
         submitted = st.form_submit_button("Submit Ticket")
         if submitted:
             add_ticket(task, domain, deadline, status, comments)
             st.success("✅ Ticket added successfully!")
 
-# Load data
+# ──────────────────────────────────────
+# 🔄  Load data & elapsed-time sync
 df = get_data()
 if not df.empty:
     update_elapsed_in_sheet(df)
 
-# Summary
+# ──────────────────────────────────────
+# 📊  Ticket status summary
 st.subheader("📊 Ticket Status Overview")
 status_counts = df["Status"].value_counts().to_dict()
-status_icons = {"Completed": "🟢", "Partial": "🟡", "Stuck": "🔴", "Initiated": "⚪"}
-st.markdown(" | ".join(f"{status_icons.get(k, '❔')} **{k}**: {v}" for k, v in status_counts.items()))
+status_icons  = {"Completed": "🟢", "Partial": "🟡", "Stuck": "🔴", "Initiated": "⚪"}
+st.markdown(" | ".join(f"{status_icons.get(k, '❔')} **{k}**: {v}"
+                       for k, v in status_counts.items()))
 
-# Filters
+# ──────────────────────────────────────
+# 🔍  Filters
 st.subheader("🔍 Filters")
-col1, col2 = st.columns(2)
-status_filter = col1.multiselect("Filter by Status", options=df["Status"].unique(), default=df["Status"].unique())
-domain_filter = col2.multiselect("Filter by Domain", options=df["Domain"].unique(), default=df["Domain"].unique())
+status_filter = multiselect_with_select_all("Status",
+                                            df["Status"].unique().tolist(),
+                                            "status_filter")
+domain_filter = multiselect_with_select_all("Domain",
+                                            df["Domain"].unique().tolist(),
+                                            "domain_filter")
+
+# Default: show everything
+if not status_filter:
+    status_filter = df["Status"].unique().tolist()
+if not domain_filter:
+    domain_filter = df["Domain"].unique().tolist()
+
 filtered_df = df[df["Status"].isin(status_filter) & df["Domain"].isin(domain_filter)]
 
-# Display Tickets
+# ──────────────────────────────────────
+# 📋  Ticket list
 st.subheader("📋 Filtered Tickets")
 now = datetime.now()
 
+STATUS_COLORS = {
+    "Completed": "#4caf50",     # green
+    "Partial":   "#fbc02d",     # yellow
+    "Stuck":     "#e53935",     # red
+    "Initiated": "#90a4ae",     # grey-blue
+}
+
 for _, row in filtered_df.iterrows():
     created_time = row['Created At']
-    deadline = row['Deadline']
-    elapsed = now - created_time
-    elapsed_str = str(elapsed).split('.')[0]
-    sheet_row = row['SheetRow']
+    deadline     = row['Deadline']
+    elapsed      = now - created_time
+    elapsed_str  = str(elapsed).split('.')[0]
+    sheet_row    = row['SheetRow']
 
-    border_color = "#ccc"
-    if now.date() > deadline.date():
-        border_color = "#e53935"
-    elif (deadline.date() - now.date()).days <= 2:
-        border_color = "#fbc02d"
+    border_color = STATUS_COLORS.get(row['Status'], "#ccc")
 
     with st.container():
         st.markdown(f"""
             <div class="ticket-card" style="border-left: 6px solid {border_color};">
                 <div class="ticket-header">
-                    {row['Task']} <span class="pill">{row['Status']}</span>
+                    {row['Task']}
+                    <span class="pill">{row['Status']}</span>
                 </div>
                 <div>🛠️ <b>Domain:</b> {row['Domain']}</div>
                 <div>🕑 <b>Created:</b> {created_time.strftime('%Y-%m-%d %H:%M')}</div>
@@ -180,7 +248,13 @@ for _, row in filtered_df.iterrows():
             </div>
         """, unsafe_allow_html=True)
 
-        if st.session_state["role"] == "admin":
+        # ——— permissions ———
+        can_modify = (
+            st.session_state["role"] == "admin" or
+            row["Domain"] == st.session_state.get("user_domain")
+        )
+
+        if can_modify:
             colA, colB = st.columns([1, 1])
             if colA.button("🗑️ Delete", key=f"del_{sheet_row}"):
                 delete_ticket(sheet_row)
@@ -190,35 +264,45 @@ for _, row in filtered_df.iterrows():
             if colB.button("✏️ Edit", key=f"edit_btn_{sheet_row}"):
                 st.session_state[f"edit_{sheet_row}"] = True
 
+            # ——— Edit modal ———
             if st.session_state.get(f"edit_{sheet_row}", False):
                 with st.form(f"edit_form_{sheet_row}"):
-                    domain_options = ["Leasing", "Design", "Equipment", "Project Management", "Construction"]
-                    status_options = ["Initiated", "Partial", "Stuck", "Completed"]
-
                     new_task = st.text_input("Edit Task", value=row['Task'])
-                    new_domain = st.selectbox("Edit Domain", domain_options, index=domain_options.index(row['Domain']) if row['Domain'] in domain_options else 0)
-                    new_deadline = st.date_input("Edit Deadline", value=row['Deadline'])
-                    new_status = st.selectbox("Edit Status", status_options, index=status_options.index(row['Status']) if row['Status'] in status_options else 0)
+
+                    if st.session_state["role"] == "admin":
+                        new_domain = st.selectbox("Edit Domain",
+                                                  ALL_DOMAINS,
+                                                  index=ALL_DOMAINS.index(row['Domain']))
+                    else:
+                        new_domain = row['Domain']
+                        st.text_input("Edit Domain", value=new_domain, disabled=True)
+
+                    new_deadline = st.date_input("Edit Deadline", value=row['Deadline'].date())
+                    new_status   = st.selectbox("Edit Status",
+                                                ALL_STATUSES,
+                                                index=ALL_STATUSES.index(row['Status']))
                     new_comments = st.text_area("Edit Comments", value=row['Comments'])
 
                     save = st.form_submit_button("Save Changes")
                     if save:
-                        update_ticket(sheet_row, new_task, new_domain, new_deadline, new_status, new_comments)
+                        update_ticket(sheet_row, new_task, new_domain,
+                                      new_deadline, new_status, new_comments)
                         st.success("✅ Ticket updated!")
                         del st.session_state[f"edit_{sheet_row}"]
                         st.rerun()
 
-# Chart
-st.subheader("📆 Deadlines Overview")
+# ──────────────────────────────────────
+# 📆  Deadline histogram
+st.subheader("🗓️ Deadlines Overview")
 deadline_chart = (
     alt.Chart(df)
-    .mark_bar()
-    .encode(
-        x=alt.X('Deadline:T', title='Deadline'),
-        y=alt.Y('count():Q', title='Tickets'),
-        color=alt.Color('Status:N'),
-        tooltip=['Task', 'Domain', 'Deadline', 'Status']
-    )
-    .properties(height=300)
+       .mark_bar()
+       .encode(
+           x=alt.X('Deadline:T', title='Deadline'),
+           y=alt.Y('count():Q', title='Tickets'),
+           color=alt.Color('Status:N'),
+           tooltip=['Task', 'Domain', 'Deadline', 'Status']
+       )
+       .properties(height=300)
 )
 st.altair_chart(deadline_chart, use_container_width=True)
