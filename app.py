@@ -1,14 +1,17 @@
 # app.py
 # ─────────────────────────────────────────────────────────────
 #  Team Ticket Dashboard  –  multi-user edition
+#  (Streamlit Cloud-ready: uses st.secrets for credentials)
 # ─────────────────────────────────────────────────────────────
 
 import streamlit as st
 import pandas as pd
 import gspread
+import json
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import altair as alt
+import os
 
 # ──────────────────────────────────────
 # ⚙️  Page setup
@@ -28,8 +31,7 @@ USERS = {
     "pm":           {"password": "PM123", "role": "user", "domain": "Project Management"},
 }
 
-ALL_DOMAINS = ["Leasing", "Design", "Equipment",
-               "Construction", "Project Management"]
+ALL_DOMAINS  = ["Leasing", "Design", "Equipment", "Construction", "Project Management"]
 ALL_STATUSES = ["Initiated", "Partial", "Stuck", "Completed"]
 
 # ──────────────────────────────────────
@@ -46,9 +48,9 @@ def login() -> None:
             user = USERS.get(email)
             if user and password == user["password"]:
                 st.session_state["logged_in"]   = True
-                st.session_state["role"]        = user["role"]       # admin/user
+                st.session_state["role"]        = user["role"]
                 st.session_state["email"]       = email
-                st.session_state["user_domain"] = user["domain"]     # None for admin
+                st.session_state["user_domain"] = user["domain"]
                 st.rerun()
             else:
                 st.error("❌ Incorrect credentials")
@@ -71,25 +73,38 @@ with st.sidebar:
         st.rerun()
 
 # ──────────────────────────────────────
-# ✅  Google Sheets connection
+# ✅  Google Sheets connection (local or Cloud secrets)
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-client = gspread.authorize(creds)
-sheet = client.open("TicketDashboard").sheet1
+
+def get_gspread_client():
+    # 1️⃣ Try Streamlit Cloud secrets
+    if "GOOGLE_SHEETS_CREDENTIALS" in st.secrets:
+        creds_dict = json.loads(st.secrets["GOOGLE_SHEETS_CREDENTIALS"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    # 2️⃣ Fallback to local credentials.json
+    elif os.path.exists("credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    else:
+        st.error("❌ No Google credentials found. "
+                 "Add credentials.json locally *or* set GOOGLE_SHEETS_CREDENTIALS in secrets.")
+        st.stop()
+    return gspread.authorize(creds)
+
+client = get_gspread_client()
+sheet  = client.open("TicketDashboard").sheet1
 
 # ──────────────────────────────────────
 # 📦  Data helpers
 def get_data() -> pd.DataFrame:
-    """Read all rows, convert date columns, add actual sheet row numbers."""
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
     if not df.empty:
         df["Created At"] = pd.to_datetime(df["Created At"])
         df["Deadline"]   = pd.to_datetime(df["Deadline"])
-        df["SheetRow"]   = [i + 2 for i in range(len(df))]  # +2 skips header row
+        df["SheetRow"]   = [i + 2 for i in range(len(df))]  # +2 skips header
     return df
 
 def add_ticket(task: str, domain: str, deadline, status: str, comments: str) -> None:
@@ -99,9 +114,8 @@ def add_ticket(task: str, domain: str, deadline, status: str, comments: str) -> 
 
 def update_elapsed_in_sheet(df: pd.DataFrame) -> None:
     now = datetime.now()
-    elapsed_days = (now - df['Created At']).dt.days
-    for idx, days in enumerate(elapsed_days):
-        sheet.update_cell(idx + 2, 6, f"{days}")
+    for idx, created in enumerate(df['Created At']):
+        sheet.update_cell(idx + 2, 6, f"{(now - created).days}")
 
 def delete_ticket(sheet_row: int) -> None:
     sheet.delete_rows(sheet_row)
@@ -117,14 +131,13 @@ def update_ticket(sheet_row: int, task: str, domain: str,
     )
 
 # ──────────────────────────────────────
-# ✅  Multiselect helper with “Select all” (no session-state mutation)
+# ✅  Multiselect helper with “Select all”
 def multiselect_with_select_all(label: str, options: list[str], key_prefix: str) -> list[str]:
     select_all_key  = f"{key_prefix}_select_all"
     multiselect_key = f"{key_prefix}_multiselect"
 
     select_all = st.checkbox(f"Select all {label.lower()}", key=select_all_key)
     if select_all:
-        # disabled multiselect acts as visual feedback
         st.multiselect(label, options, default=options, key=multiselect_key, disabled=True)
         return options
     else:
@@ -204,7 +217,6 @@ domain_filter = multiselect_with_select_all("Domain",
                                             df["Domain"].unique().tolist(),
                                             "domain_filter")
 
-# Default: show everything
 if not status_filter:
     status_filter = df["Status"].unique().tolist()
 if not domain_filter:
@@ -227,8 +239,7 @@ STATUS_COLORS = {
 for _, row in filtered_df.iterrows():
     created_time = row['Created At']
     deadline     = row['Deadline']
-    elapsed      = now - created_time
-    elapsed_str  = str(elapsed).split('.')[0]
+    elapsed_str  = str(now - created_time).split('.')[0]
     sheet_row    = row['SheetRow']
 
     border_color = STATUS_COLORS.get(row['Status'], "#ccc")
@@ -264,7 +275,6 @@ for _, row in filtered_df.iterrows():
             if colB.button("✏️ Edit", key=f"edit_btn_{sheet_row}"):
                 st.session_state[f"edit_{sheet_row}"] = True
 
-            # ——— Edit modal ———
             if st.session_state.get(f"edit_{sheet_row}", False):
                 with st.form(f"edit_form_{sheet_row}"):
                     new_task = st.text_input("Edit Task", value=row['Task'])
@@ -277,14 +287,13 @@ for _, row in filtered_df.iterrows():
                         new_domain = row['Domain']
                         st.text_input("Edit Domain", value=new_domain, disabled=True)
 
-                    new_deadline = st.date_input("Edit Deadline", value=row['Deadline'].date())
+                    new_deadline = st.date_input("Edit Deadline", value=deadline.date())
                     new_status   = st.selectbox("Edit Status",
                                                 ALL_STATUSES,
                                                 index=ALL_STATUSES.index(row['Status']))
                     new_comments = st.text_area("Edit Comments", value=row['Comments'])
 
-                    save = st.form_submit_button("Save Changes")
-                    if save:
+                    if st.form_submit_button("Save Changes"):
                         update_ticket(sheet_row, new_task, new_domain,
                                       new_deadline, new_status, new_comments)
                         st.success("✅ Ticket updated!")
